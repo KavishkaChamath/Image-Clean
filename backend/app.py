@@ -16,14 +16,39 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-# --- Device ---
-device = torch.device("cpu")  # Free hosting usually has no GPU
+# --- Device (CPU for free hosting) ---
+device = torch.device("cpu")
+
+
+# --- Function to fix DataParallel weights ---
+def load_model_weights(model, weight_path, device):
+    state_dict = torch.load(weight_path, map_location=device)
+
+    # Remove "module." prefix if model was trained with DataParallel
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith("module."):
+            new_state_dict[k[7:]] = v
+        else:
+            new_state_dict[k] = v
+
+    model.load_state_dict(new_state_dict)
+    return model
+
 
 # --- Load model ---
 model = ImprovedDnCNN()
-model.load_state_dict(torch.load("dncnn_color.pth", map_location=device))
+model = load_model_weights(model, "dncnn_color.pth", device)
 model.to(device)
 model.eval()
+
+
+# --- Image resize safeguard ---
+def resize_if_large(img, max_dim=512):
+    if max(img.size) > max_dim:
+        img.thumbnail((max_dim, max_dim))
+    return img
+
 
 # --- Endpoint ---
 @app.post("/denoise")
@@ -33,19 +58,17 @@ async def denoise(file: UploadFile = File(...)):
         img_bytes = await file.read()
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
-        # Resize if image is too big (prevent crashes)
-        max_dim = 512
-        if max(img.size) > max_dim:
-            img.thumbnail((max_dim, max_dim))
+        # Resize large images (protects server memory)
+        img = resize_if_large(img)
 
-        # Convert to tensor and add batch
+        # Convert to tensor and add batch dimension
         input_tensor = TF.to_tensor(img).unsqueeze(0).to(device)
 
         # Inference
         with torch.no_grad():
-            output_tensor = model(input_tensor)
+            output_tensor = model(input_tensor).clamp(0, 1)
 
-        # Convert tensor to PIL image
+        # Convert tensor back to image
         output_img = TF.to_pil_image(output_tensor.squeeze(0).cpu())
         buf = io.BytesIO()
         output_img.save(buf, format="PNG")
